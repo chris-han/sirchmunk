@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -20,7 +20,12 @@ from sirchmunk.llm.prompts import (
     SEARCH_RESULT_SUMMARY,
 )
 from sirchmunk.retrieve.text_retriever import GrepRetriever
-from sirchmunk.schema.knowledge import KnowledgeCluster
+from sirchmunk.schema.knowledge import (
+    AbstractionLevel,
+    EvidenceUnit,
+    KnowledgeCluster,
+    Lifecycle,
+)
 from sirchmunk.schema.request import ContentItem, Message, Request
 from sirchmunk.schema.search_context import SearchContext
 from sirchmunk.storage.knowledge_storage import KnowledgeStorage
@@ -372,19 +377,79 @@ class AgenticSearch(BaseSearch):
     
     @staticmethod
     def _make_answer_cluster(
-        query: str, answer: str, prefix: str = "FS",
+        query: str,
+        answer: str,
+        prefix: str = "FS",
+        file_paths: Optional[List[str]] = None,
     ) -> KnowledgeCluster:
-        """Create a lightweight KnowledgeCluster wrapping an answer string."""
+        """Create a fallback KnowledgeCluster wrapping an answer string.
+
+        Used when the full evidence pipeline didn't produce a cluster
+        (e.g. FAST early-termination or ReAct fallback).  Populates all
+        key attributes so callers never receive a half-empty cluster.
+        """
         _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
-        cluster = KnowledgeCluster(
+        resources = [
+            {"type": "file", "value": fp} for fp in (file_paths or [])
+        ]
+        return KnowledgeCluster(
             id=f"{prefix}{_digest}",
             name=query[:60],
             description=[f"Search result for: {query}"],
             content=answer,
             queries=[query],
+            search_results=list(file_paths or []),
+            resources=resources or None,
+            confidence=0.5,
+            abstraction_level=AbstractionLevel.TECHNIQUE,
+            hotness=0.5,
+            lifecycle=Lifecycle.EMERGING,
         )
-        cluster.search_results.append(answer)
-        return cluster
+
+    @staticmethod
+    def _build_fast_cluster(
+        query: str,
+        answer: str,
+        file_path: str,
+        evidence: str,
+        keywords: List[str],
+    ) -> KnowledgeCluster:
+        """Build a KnowledgeCluster from FAST-mode grep evidence.
+
+        Richer than ``_make_answer_cluster``: contains a real EvidenceUnit
+        sourced from the file that was actually retrieved.
+        """
+        _digest = hashlib.sha256(query.encode("utf-8")).hexdigest()[:8]
+        doc_id = hashlib.sha256(file_path.encode("utf-8")).hexdigest()[:12]
+
+        evidence_unit = EvidenceUnit(
+            doc_id=doc_id,
+            file_or_url=file_path,
+            summary=evidence[:500] if evidence else "",
+            is_found=True,
+            snippets=(
+                [{"snippet": evidence[:2000], "score": 1.0}]
+                if evidence else []
+            ),
+            extracted_at=datetime.now(timezone.utc),
+        )
+
+        return KnowledgeCluster(
+            id=f"FS{_digest}",
+            name=query[:60],
+            description=[f"FAST search result for: {query}"],
+            content=answer,
+            evidences=[evidence_unit],
+            patterns=keywords[:3],
+            confidence=0.7,
+            abstraction_level=AbstractionLevel.TECHNIQUE,
+            landmark_potential=0.3,
+            hotness=0.5,
+            lifecycle=Lifecycle.EMERGING,
+            queries=[query],
+            search_results=[file_path],
+            resources=[{"type": "file", "value": file_path}],
+        )
 
     async def _search_by_filename(
         self,
@@ -644,7 +709,7 @@ class AgenticSearch(BaseSearch):
         mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
         max_loops: int = 10,
         max_token_budget: int = 64000,
-        max_depth: Optional[int] = 5,
+        max_depth: Optional[int] = 8,
         top_k_files: int = 3,
         enable_dir_scan: bool = True,
         include: Optional[List[str]] = None,
@@ -652,7 +717,13 @@ class AgenticSearch(BaseSearch):
         return_context: bool = False,
         return_cluster: bool = False,
         spec_stale_hours: float = 72.0,
-    ) -> Union[str, Tuple[str, SearchContext], List[Dict[str, Any]], KnowledgeCluster]:
+    ) -> Union[
+        str,
+        Tuple[str, SearchContext],
+        KnowledgeCluster,
+        Tuple[KnowledgeCluster, SearchContext],
+        List[Dict[str, Any]],
+    ]:
         """Perform intelligent search with multi-mode support.
 
         Modes:
@@ -731,13 +802,18 @@ class AgenticSearch(BaseSearch):
                 Used in both FILENAME_ONLY and DEEP modes.
             return_context: If True, return ``(answer, SearchContext)`` tuple.
             return_cluster: If True, return the full KnowledgeCluster.
+                When ``reuse_knowledge=True`` and a cached cluster matches,
+                the **original** cluster is returned — preserving all
+                evidences, confidence, and metadata from the prior search.
             spec_stale_hours: Hours before spec cache is stale (default: 72).
 
         Returns:
             - ``str``: Answer summary (default).
-            - ``(str, SearchContext)``: If *return_context*.
-            - ``KnowledgeCluster``: If *return_cluster*.
-            - ``List[Dict]``: File matches in FILENAME_ONLY mode.
+            - ``(str, SearchContext)``: If *return_context* only.
+            - ``KnowledgeCluster``: If *return_cluster* only.
+            - ``(KnowledgeCluster, SearchContext)``: If **both** flags set.
+            - ``List[Dict]``: File matches in FILENAME_ONLY mode
+              (``return_context`` / ``return_cluster`` do not apply).
         """
         paths = self._resolve_paths(paths)
 
@@ -754,14 +830,12 @@ class AgenticSearch(BaseSearch):
             await self._logger.success(f"Retrieved {len(results)} matching files")
             return results
 
-        # ---- FAST / DEEP → both produce (answer, optional cluster) ----
+        # ---- FAST / DEEP → both produce (answer, cluster, context) ----
         if mode == "FAST":
-            answer = await self._search_fast(
+            answer, cluster, context = await self._search_fast(
                 query=query, paths=paths, max_depth=max_depth,
                 top_k_files=top_k_files, include=include, exclude=exclude,
             )
-            cluster: Optional[KnowledgeCluster] = None
-            context = SearchContext()
         else:
             answer, cluster, context = await self._search_deep(
                 query=query, paths=paths,
@@ -772,7 +846,17 @@ class AgenticSearch(BaseSearch):
                 spec_stale_hours=spec_stale_hours,
             )
 
+        # ---- Persist cluster (FAST clusters are now saved too) ----
+        if cluster and not return_cluster:
+            # Fire-and-forget persistence when caller only wants the answer.
+            # When return_cluster is True the caller controls the lifecycle.
+            pass  # persistence already handled inside _search_deep / _search_fast
+
         # ---- Unified return wrapping ----
+        if return_cluster and return_context:
+            prefix = "FS" if mode == "FAST" else "DS"
+            final_cluster = cluster or self._make_answer_cluster(query, answer, prefix)
+            return final_cluster, context
         if return_cluster:
             prefix = "FS" if mode == "FAST" else "DS"
             return cluster or self._make_answer_cluster(query, answer, prefix)
@@ -926,7 +1010,8 @@ class AgenticSearch(BaseSearch):
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
             answer = await self._summarise_cluster(query, cluster)
-            cluster.search_results.append(answer)
+            if not cluster.search_results:
+                cluster.search_results = list(merged_files)
         else:
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
             answer, context = await self._react_refinement(
@@ -944,7 +1029,6 @@ class AgenticSearch(BaseSearch):
                 )
             elif answer and not cluster.content:
                 cluster.content = answer
-                cluster.search_results.append(answer)
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1043,34 +1127,18 @@ class AgenticSearch(BaseSearch):
         top_k_files: int = 2,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-    ) -> str:
+    ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2 LLM calls, single best file, focused evidence.
 
         Two-level keyword cascade extracted in one LLM call:
         primary (compound phrase) is tried first; if it misses, fallback
         (atomic terms) is tried.  Greedy early-termination at every step.
 
-        Architecture:
-            ┌──────────────────────────────────────────────────────────┐
-            │ Step 0  Cluster reuse check (instant short-circuit)       │
-            ├──────────────────────────────────────────────────────────┤
-            │ Step 1  LLM → primary + fallback keywords (stream=False) │
-            │ Step 2  rga cascade: primary → fallback → filename       │
-            │ Step 3  Context sampling around grep hit lines            │
-            │ Step 4  LLM answer from focused evidence                  │
-            └──────────────────────────────────────────────────────────┘
-
-        Args:
-            query: User search query.
-            paths: Normalised list of path strings.
-            max_depth: Maximum directory depth for rga search.
-            top_k_files: Unused (kept for API compat); greedy picks 1 file.
-            include: File glob patterns to include.
-            exclude: File glob patterns to exclude.
-
         Returns:
-            Answer string from LLM.
+            ``(answer, cluster, context)`` — same triple as ``_search_deep``
+            so the caller can handle both modes uniformly.
         """
+        context = SearchContext()
         await self._logger.info(f"[FAST] Starting greedy search for: '{query[:80]}'")
 
         # ==============================================================
@@ -1082,7 +1150,7 @@ class AgenticSearch(BaseSearch):
             if isinstance(content, list):
                 content = "\n".join(content)
             await self._logger.success("[FAST] Reused cached knowledge cluster")
-            return str(content)
+            return str(content), reused, context
 
         # ==============================================================
         # Step 1: LLM → 2-level keywords in one call (stream=False)
@@ -1093,6 +1161,10 @@ class AgenticSearch(BaseSearch):
             stream=False,
         )
         self.llm_usages.append(resp.usage)
+        if resp.usage and isinstance(resp.usage, dict):
+            context.add_llm_tokens(
+                resp.usage.get("total_tokens", 0), usage=resp.usage,
+            )
 
         analysis = self._parse_fast_json(resp.content)
         primary = analysis.get("primary", [])[:2]
@@ -1101,7 +1173,8 @@ class AgenticSearch(BaseSearch):
 
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
-            return f"Could not extract search terms from query: '{query}'"
+            msg = f"Could not extract search terms from query: '{query}'"
+            return msg, None, context
 
         await self._logger.info(
             f"[FAST:Step1] Primary: {primary}, Fallback: {fallback}"
@@ -1110,6 +1183,7 @@ class AgenticSearch(BaseSearch):
         # ==============================================================
         # Step 2: rga cascade — primary first, fallback only if needed
         # ==============================================================
+        context.add_search(query)
         include_patterns = list(include or [])
         for hint in file_hints:
             if "*" in hint or "." in hint:
@@ -1138,7 +1212,8 @@ class AgenticSearch(BaseSearch):
                 f"[FAST:Step2] No matching files found in paths: {paths}. "
                 "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
             )
-            return f"No relevant content found for query: '{query}'"
+            msg = f"No relevant content found for query: '{query}'"
+            return msg, None, context
 
         file_path = best_file["path"]
         match_objects = best_file["matches"]
@@ -1151,9 +1226,12 @@ class AgenticSearch(BaseSearch):
         # Step 3: Context sampling around grep hits (no LLM)
         # ==============================================================
         evidence = await self._fast_sample_evidence(file_path, match_objects)
+        context.mark_file_read(file_path)
+
         if not evidence or len(evidence.strip()) < 20:
             await self._logger.warning("[FAST:Step3] No usable evidence extracted")
-            return f"Found file but could not extract content for query: '{query}'"
+            msg = f"Found file but could not extract content for query: '{query}'"
+            return msg, None, context
 
         await self._logger.info(
             f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
@@ -1171,9 +1249,26 @@ class AgenticSearch(BaseSearch):
             stream=True,
         )
         self.llm_usages.append(answer_resp.usage)
+        if answer_resp.usage and isinstance(answer_resp.usage, dict):
+            context.add_llm_tokens(
+                answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
+            )
+
+        answer = answer_resp.content or ""
+        keywords_used = primary if used_level == "primary" else fallback
+        cluster = self._build_fast_cluster(
+            query, answer, file_path, evidence, keywords_used,
+        )
+
+        # Persist the FAST cluster so it can be reused by future queries
+        self._add_query_to_cluster(cluster, query)
+        try:
+            await self._save_cluster_with_embedding(cluster)
+        except Exception:
+            pass
 
         await self._logger.success("[FAST] Search complete (2 LLM calls)")
-        return answer_resp.content or ""
+        return answer, cluster, context
 
     # ---- FAST helpers ----
 
@@ -1727,12 +1822,15 @@ class AgenticSearch(BaseSearch):
                 top_k_files=top_k_files,
             )
             if cluster:
-                cluster.search_results.append(answer)
+                if not cluster.search_results:
+                    cluster.search_results = list(discovered)
                 return cluster
 
         # Fallback: lightweight cluster from answer text
         try:
-            return self._make_answer_cluster(query, answer, prefix="R")
+            return self._make_answer_cluster(
+                query, answer, prefix="R", file_paths=discovered,
+            )
         except Exception:
             return None
 
