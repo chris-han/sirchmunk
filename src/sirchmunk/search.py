@@ -789,7 +789,7 @@ class AgenticSearch(BaseSearch):
     def _ensure_tool_registry(
         self,
         paths: List[str],
-        enable_dir_scan: bool = True,
+        enable_dir_scan: bool = False,
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
@@ -879,7 +879,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 8,
         top_k_files: int = 5,
-        enable_dir_scan: bool = True,
+        enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         return_context: bool = False,
@@ -1046,7 +1046,7 @@ class AgenticSearch(BaseSearch):
         max_token_budget: int = 128000,
         max_depth: Optional[int] = 5,
         top_k_files: int = 5,
-        enable_dir_scan: bool = True,
+        enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
@@ -1497,7 +1497,7 @@ class AgenticSearch(BaseSearch):
         *,
         max_depth: Optional[int] = 5,
         top_k_files: int = 3,
-        enable_dir_scan: bool = True,
+        enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
@@ -1529,33 +1529,13 @@ class AgenticSearch(BaseSearch):
             return str(content), reused, context
 
         # ==============================================================
-        # Step 1: [Parallel] LLM keyword extraction + Dir scan
-        # Dir scan runs concurrently (filesystem-only phase) so it adds
-        # negligible wall-clock time to the keyword extraction LLM call.
+        # Step 1: LLM query analysis only (dir scan deferred until needed)
         # ==============================================================
-        async def _step1_keywords():
-            prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
-            return await self.llm.achat(
-                messages=[{"role": "user", "content": prompt}],
-                stream=False,
-            )
-
-        step1_results = await asyncio.gather(
-            _step1_keywords(),
-            self._probe_dir_scan(paths, enable=enable_dir_scan, max_files=300),
-            return_exceptions=True,
+        prompt = FAST_QUERY_ANALYSIS.format(user_input=query)
+        resp = await self.llm.achat(
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
         )
-
-        resp = step1_results[0] if not isinstance(step1_results[0], Exception) else None
-        scan_result = step1_results[1] if not isinstance(step1_results[1], Exception) else None
-
-        if isinstance(step1_results[0], Exception):
-            await self._logger.warning(f"[FAST:Step1] Keyword extraction failed: {step1_results[0]}")
-            msg = f"Failed to analyze query: '{query}'"
-            return msg, None, context
-        if isinstance(step1_results[1], Exception):
-            await self._logger.warning(f"[FAST:Step1] Dir scan failed: {step1_results[1]}")
-
         self.llm_usages.append(resp.usage)
         if resp.usage and isinstance(resp.usage, dict):
             context.add_llm_tokens(
@@ -1563,8 +1543,8 @@ class AgenticSearch(BaseSearch):
             )
 
         analysis = self._parse_fast_json(resp.content)
-
         query_type = analysis.get("type", "search")
+        file_hints = analysis.get("file_hints", [])
 
         if query_type == "chat":
             chat_reply = analysis.get("response", "")
@@ -1575,6 +1555,24 @@ class AgenticSearch(BaseSearch):
 
         if query_type == "summary":
             await self._logger.info("[FAST:Step1] Summary intent detected — delegating to doc analysis")
+            # When user names a specific file, resolve it and skip dir scan + rank
+            summary_paths: Optional[List[str]] = None
+            if file_hints:
+                summary_paths = self._resolve_file_hints(paths, file_hints)
+                if summary_paths:
+                    await self._logger.info(
+                        f"[FAST:Summary] Resolved file hint(s) → {[Path(p).name for p in summary_paths]}"
+                    )
+            if summary_paths:
+                answer = await self._summarize_documents(
+                    query, summary_paths,
+                    top_k_files=len(summary_paths),
+                    scan_result=None,
+                )
+                if answer:
+                    return answer, self._make_answer_cluster(query, answer, "FS"), context
+            # No hint or resolve failed: run dir scan (if enabled) then rank + summarize
+            scan_result = await self._probe_dir_scan(paths, enable=enable_dir_scan, max_files=300) if enable_dir_scan else None
             answer = await self._summarize_documents(
                 query, paths,
                 top_k_files=top_k_files,
@@ -1588,7 +1586,6 @@ class AgenticSearch(BaseSearch):
         fallback = analysis.get("fallback", [])[:3]
         primary_alt = analysis.get("primary_alt", [])[:2]
         fallback_alt = analysis.get("fallback_alt", [])[:3]
-        file_hints = analysis.get("file_hints", [])
 
         if primary_alt:
             primary = primary + primary_alt
@@ -1606,6 +1603,7 @@ class AgenticSearch(BaseSearch):
 
         # ==============================================================
         # Step 2: rga cascade — primary first, fallback only if needed
+        # Dir scan runs only when enabled, for fallback when rga misses.
         # ==============================================================
         context.add_search(query)
         include_patterns = list(include or [])
@@ -1631,15 +1629,17 @@ class AgenticSearch(BaseSearch):
             )
             best_file = await self._fast_find_best_file(fallback, **rga_kwargs)
 
-        # --- Fallback: use dir_scan ranked files when rga misses ---
-        if not best_file and scan_result is not None:
-            await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
-            ranked_paths = await self._rank_dir_scan_candidates(
-                query, scan_result, top_k=10, include_medium=True,
-            )
-            if ranked_paths:
-                used_level = "dir_scan"
-                best_file = {"path": ranked_paths[0], "matches": [], "total_matches": 0}
+        # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
+        if not best_file and enable_dir_scan:
+            scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
+            if scan_result is not None:
+                await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
+                ranked_paths = await self._rank_dir_scan_candidates(
+                    query, scan_result, top_k=10, include_medium=True,
+                )
+                if ranked_paths:
+                    used_level = "dir_scan"
+                    best_file = {"path": ranked_paths[0], "matches": [], "total_matches": 0}
 
         if not best_file:
             await self._logger.warning(
@@ -1978,6 +1978,82 @@ class AgenticSearch(BaseSearch):
     def _has_directory_paths(paths: List[str]) -> bool:
         """Return True if any element in *paths* is a directory."""
         return any(Path(p).is_dir() for p in paths)
+
+    @staticmethod
+    def _resolve_file_hints(
+        paths: List[str],
+        file_hints: List[str],
+        max_depth: int = 8,
+    ) -> List[str]:
+        """Resolve file_hints (filenames) to absolute paths under *paths*.
+
+        Lightweight name-only search: no metadata extraction. Used when the
+        user clearly asks for a specific document (e.g. "总结《foo.pdf》")
+        so we can skip full dir scan + LLM rank.
+
+        Returns:
+            List of absolute path strings that match any hint (deduplicated,
+            order preserved). Empty if no matches.
+        """
+        if not file_hints:
+            return []
+
+        hints = [h.strip() for h in file_hints if (h and isinstance(h, str))]
+        if not hints:
+            return []
+
+        def _name_matches(name: str, hint: str) -> bool:
+            name_n = name.strip()
+            hint_n = hint.strip()
+            if not hint_n:
+                return False
+            if name_n == hint_n:
+                return True
+            if hint_n.lower() in name_n.lower():
+                return True
+            if Path(name_n).stem == Path(hint_n).stem:
+                return True
+            return False
+
+        seen: set = set()
+        out: List[str] = []
+
+        def walk_dir(d: Path, depth: int) -> None:
+            if depth > max_depth or len(out) >= 20:
+                return
+            try:
+                for entry in sorted(d.iterdir(), key=lambda p: p.name):
+                    if len(out) >= 20:
+                        return
+                    if entry.name.startswith("."):
+                        continue
+                    if entry.is_file():
+                        for hint in hints:
+                            if _name_matches(entry.name, hint):
+                                resolved = str(entry.resolve())
+                                if resolved not in seen:
+                                    seen.add(resolved)
+                                    out.append(resolved)
+                                break
+                    elif entry.is_dir():
+                        walk_dir(entry, depth + 1)
+            except PermissionError:
+                pass
+
+        for p_str in paths:
+            p = Path(p_str).resolve()
+            if p.is_file():
+                for hint in hints:
+                    if _name_matches(p.name, hint):
+                        resolved = str(p)
+                        if resolved not in seen:
+                            seen.add(resolved)
+                            out.append(resolved)
+                        break
+            elif p.is_dir():
+                walk_dir(p, 0)
+
+        return out
 
     async def _probe_dir_scan(
         self,

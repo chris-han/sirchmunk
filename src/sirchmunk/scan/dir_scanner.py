@@ -94,9 +94,26 @@ class FileCandidate:
             "reason": self.reason,
         }
 
-    def to_summary(self) -> str:
-        """Compact text summary for LLM consumption."""
-        parts = [f"- **{self.filename}** ({self.extension}, {self._human_size()})"]
+    def to_summary(self, root_dir: str = "") -> str:
+        """Compact text summary for LLM consumption.
+
+        Paths are normalized to forward slashes for cross-OS consistency
+        (prompts and LLM output use the same format on Windows and Unix).
+
+        Args:
+            root_dir: When provided, the ``path`` is shown as a relative
+                path from this root — making directory structure visible.
+        """
+        if root_dir:
+            try:
+                rel = Path(self.path).relative_to(Path(root_dir))
+                rel = rel.as_posix()
+            except (ValueError, TypeError):
+                rel = Path(self.path).as_posix()
+        else:
+            rel = Path(self.path).as_posix()
+
+        parts = [f"- **{rel}** ({self.extension}, {self._human_size()})"]
         if self.title:
             parts.append(f"  Title: {self.title}")
         if self.author:
@@ -112,7 +129,6 @@ class FileCandidate:
         if self.modified_at:
             parts.append(f"  Modified: {self.modified_at[:10]}")
         if self.preview:
-            # Show more preview for files with content loaded
             max_preview = 500 if self.content_loaded else 200
             clean = self.preview[:max_preview].replace(chr(10), ' ').strip()
             parts.append(f"  Preview: {clean}")
@@ -295,7 +311,7 @@ class DirectoryScanner:
             )
 
         # Extract metadata in parallel
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             candidates = await loop.run_in_executor(
                 pool,
@@ -336,11 +352,14 @@ class DirectoryScanner:
 
         t_start = datetime.now()
 
-        # Build compact summary for LLM
-        summaries = [c.to_summary() for c in scan_result.candidates[:top_k]]
+        candidates_to_rank = scan_result.candidates[:top_k]
+
+        root_dir = self._find_common_root(candidates_to_rank)
+        dir_tree = self._build_dir_tree(candidates_to_rank, root_dir)
+        summaries = [c.to_summary(root_dir=root_dir) for c in candidates_to_rank]
         scan_text = "\n\n".join(summaries)
 
-        prompt = self._build_rank_prompt(query, scan_text)
+        prompt = self._build_rank_prompt(query, scan_text, dir_tree, root_dir)
 
         try:
             response = await self.llm.achat(
@@ -746,6 +765,47 @@ class DirectoryScanner:
     # ---- Helpers ----
 
     @staticmethod
+    def _find_common_root(candidates: List[FileCandidate]) -> str:
+        """Find the longest common directory prefix for all candidates.
+
+        Returns a path string normalized with forward slashes for
+        cross-OS consistency when used in prompts and relative_to().
+        """
+        if not candidates:
+            return ""
+        paths = [Path(c.path).resolve().parent for c in candidates]
+        common = paths[0]
+        for p in paths[1:]:
+            p = p.resolve()
+            while common != p and common not in p.parents:
+                common = common.parent
+        return common.as_posix()
+
+    @staticmethod
+    def _build_dir_tree(candidates: List[FileCandidate], root_dir: str) -> str:
+        """Build a compact directory tree showing folder structure + file counts.
+
+        Paths are normalized to forward slashes for cross-OS consistency.
+        """
+        from collections import Counter
+        dir_counts: Counter = Counter()
+        root = Path(root_dir) if root_dir else None
+        for c in candidates:
+            try:
+                parent = Path(c.path).parent
+                rel_parent = parent.relative_to(root) if root else parent
+                rel_parent = rel_parent.as_posix() if rel_parent.parts else "."
+                dir_counts[rel_parent] += 1
+            except (ValueError, TypeError):
+                dir_counts["."] += 1
+
+        lines: List[str] = []
+        for d in sorted(dir_counts):
+            label = d if d != "." else "."
+            lines.append(f"  {label}/ ({dir_counts[d]} files)")
+        return "\n".join(lines)
+
+    @staticmethod
     def _detect_encoding(raw: bytes) -> str:
         """Detect text encoding from raw bytes."""
         try:
@@ -758,27 +818,40 @@ class DirectoryScanner:
     # ---- LLM ranking ----
 
     @staticmethod
-    def _build_rank_prompt(query: str, scan_text: str) -> str:
+    def _build_rank_prompt(
+        query: str,
+        scan_text: str,
+        dir_tree: str = "",
+        root_dir: str = "",
+    ) -> str:
         """Build the LLM prompt for candidate ranking."""
-        return f"""You are a document triage specialist. Analyze the directory scan results below and identify the most relevant files for answering the user's query.
-
+        tree_section = ""
+        if dir_tree:
+            tree_section = f"""
+## Directory Structure
+Root: {root_dir}
+```
+{dir_tree}
+```
+"""
+        return f"""You are a document triage specialist. Analyze the scanned files below and rank them by relevance to the user's query.
+{tree_section}
 ## User Query
 {query}
 
-## Directory Scan Results
+## Scanned Files
 {scan_text}
 
 ## Instructions
-1. Rank all scanned files by their likely relevance to the query.
-2. For each file, provide a brief reason why it may or may not be relevant.
-3. Return ONLY a JSON array — no other text.
+1. Evaluate EVERY file listed above. Consider directory names, filenames, titles, keywords, and preview content as relevance signals.
+2. Assign "high" (directly relevant), "medium" (possibly relevant), or "low" (unlikely relevant) to each file.
+3. For the "path" field, copy the **exact relative path** shown in bold (e.g. `subdir/file.pdf`) from the scan results above.
+4. Return ONLY a JSON array — no other text.
 
-## Output Format
+## Output Format (use the EXACT path shown in the file listing)
 ```json
 [
-  {{"path": "/abs/path/to/file", "relevance": "high", "reason": "brief reason"}},
-  {{"path": "/abs/path/to/file", "relevance": "medium", "reason": "brief reason"}},
-  {{"path": "/abs/path/to/file", "relevance": "low", "reason": "brief reason"}}
+  {{"path": "exact/relative/path/from/listing", "relevance": "high", "reason": "brief reason"}}
 ]
 ```"""
 
@@ -790,37 +863,50 @@ class DirectoryScanner:
         """Parse LLM ranking response and update candidate relevance.
 
         The LLM may return paths in any form — absolute, relative,
-        basename-only, or with partial directory components.  We match
-        each returned path against the candidate list using a cascade:
-        1. Exact match on ``FileCandidate.path`` (absolute).
-        2. Match on filename (basename) only.
-        3. Match on ``endswith`` (partial path suffix).
+        basename-only, or with partial directory components.  Paths are
+        normalized (forward slashes) for cross-OS matching.
         """
-        # Build multiple lookup indices for flexible matching
+        # Normalize all candidate paths for consistent matching on Windows/Unix
+        def _norm(s: str) -> str:
+            return (s or "").replace("\\", "/").strip("/")
+
         path_exact: Dict[str, FileCandidate] = {c.path: c for c in candidates}
+        path_exact_norm: Dict[str, FileCandidate] = {_norm(c.path): c for c in candidates}
         name_map: Dict[str, List[FileCandidate]] = {}
         for c in candidates:
             name_map.setdefault(c.filename, []).append(c)
 
         def _resolve(p: str) -> Optional[FileCandidate]:
             """Resolve an LLM-returned path to a FileCandidate."""
-            # 1) Exact absolute match
+            p = (p or "").strip()
+            if not p:
+                return None
+            # 1) Exact match (native or normalized)
             if p in path_exact:
                 return path_exact[p]
+            p_normalized = _norm(p)
+            if p_normalized in path_exact_norm:
+                return path_exact_norm[p_normalized]
 
-            # 2) Basename match (e.g. "report.md" → "/full/path/report.md")
-            basename = os.path.basename(p)
+            # 2) Suffix match — handles relative paths from prompt
+            for c in candidates:
+                c_norm = _norm(c.path)
+                if c_norm.endswith("/" + p_normalized) or c_norm == p_normalized:
+                    return c
+
+            # 3) Basename match (os.path.basename works with both / and \)
+            basename = os.path.basename(p.replace("\\", "/"))
             hits = name_map.get(basename)
             if hits and len(hits) == 1:
                 return hits[0]
 
-            # 3) Suffix match (e.g. "DINOv3_zh/report.md" → "/data/DINOv3_zh/report.md")
-            p_normalized = p.replace("\\", "/")
-            for c in candidates:
-                if c.path.replace("\\", "/").endswith(p_normalized):
-                    return c
+            # 4) Fuzzy: basename substring (handles LLM truncation of long CJK names)
+            if basename and len(basename) > 5:
+                for c in candidates:
+                    if basename in c.filename or c.filename in basename:
+                        return c
 
-            # 4) If multiple basename hits, pick first
+            # 5) Multiple basename hits — pick first
             if hits:
                 return hits[0]
 
