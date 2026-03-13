@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -174,7 +175,7 @@ class AgenticSearch(BaseSearch):
             )
 
         if not check_dependencies():
-            print("Installing rga (ripgrep-all) and rg (ripgrep)...", flush=True)
+            _loguru_logger.info("Installing rga (ripgrep-all) and rg (ripgrep)...")
             install_rga()
 
         # Suppress noisy pypdf warnings about malformed PDF cross-references.
@@ -327,14 +328,13 @@ class AgenticSearch(BaseSearch):
         return clean
 
     def _load_historical_knowledge(self):
-        """Load historical knowledge clusters from local cache"""
+        """Load historical knowledge clusters from local cache."""
         try:
             stats = self.knowledge_storage.get_stats()
             cluster_count = stats.get('custom_stats', {}).get('total_clusters', 0)
-            # Use sync logger for initialization
-            print(f"Loaded {cluster_count} historical knowledge clusters from cache")
+            _loguru_logger.info(f"Loaded {cluster_count} historical knowledge clusters from cache")
         except Exception as e:
-            print(f"[WARNING] Failed to load historical knowledge: {e}")
+            _loguru_logger.warning(f"Failed to load historical knowledge: {e}")
 
     async def _try_reuse_cluster(self, query: str) -> Optional[KnowledgeCluster]:
         """Try to reuse existing knowledge cluster based on semantic similarity.
@@ -379,7 +379,7 @@ class AgenticSearch(BaseSearch):
 
             best_match = similar_clusters[0]
             await self._logger.success(
-                f"♻️ Found similar cluster: {best_match['name']} "
+                f"Found similar cluster: {best_match['name']} "
                 f"(similarity: {best_match['similarity']:.3f})"
             )
 
@@ -401,7 +401,7 @@ class AgenticSearch(BaseSearch):
             # Mutate only after validation passes
             self._add_query_to_cluster(existing_cluster, query)
             existing_cluster.hotness = min(1.0, (existing_cluster.hotness or 0.5) + 0.1)
-            existing_cluster.last_modified = datetime.now()
+            existing_cluster.last_modified = datetime.now(timezone.utc)
 
             # Recompute embedding with updated queries list
             try:
@@ -702,7 +702,7 @@ class AgenticSearch(BaseSearch):
 
             if results:
                 results = results[:top_k]
-                await self._logger.success(f" ✓ Found {len(results)} matching files", flush=True)
+                await self._logger.success(f"Found {len(results)} matching files")
             else:
                 await self._logger.warning("No files matched the patterns")
 
@@ -710,12 +710,11 @@ class AgenticSearch(BaseSearch):
 
         except Exception as e:
             await self._logger.error(f"Filename search failed: {e}")
-            import traceback
             await self._logger.error(f"Traceback: {traceback.format_exc()}")
             return []
 
     @staticmethod
-    def _parse_summary_response(llm_response: str) -> tuple[str, bool]:
+    def _parse_summary_response(llm_response: str) -> Tuple[str, bool]:
         """
         Parse LLM response to extract summary and save decision.
 
@@ -778,7 +777,7 @@ class AgenticSearch(BaseSearch):
             except json.JSONDecodeError:
                 try:
                     keywords_dict = ast.literal_eval(keywords_json)
-                except Exception as e:
+                except Exception:
                     keyword_sets.append({})
                     continue
 
@@ -786,7 +785,7 @@ class AgenticSearch(BaseSearch):
             try:
                 validated = KeywordValidation(root=keywords_dict).model_dump()
                 keyword_sets.append(validated)
-            except Exception as e:
+            except Exception:
                 keyword_sets.append({})
 
         return keyword_sets
@@ -906,7 +905,7 @@ class AgenticSearch(BaseSearch):
             mode: Literal["DEEP", "FAST", "FILENAME_ONLY"] = "FAST",
             max_loops: int = 10,
             max_token_budget: int = 128000,
-            max_depth: Optional[int] = 8,
+            max_depth: Optional[int] = 5,
             top_k_files: int = 5,
             enable_dir_scan: bool = False,
             include: Optional[List[str]] = None,
@@ -982,10 +981,10 @@ class AgenticSearch(BaseSearch):
                 ``self.paths`` or the current working directory.
             mode: Search mode — ``"DEEP"``, ``"FAST"``, or ``"FILENAME_ONLY"``.
             max_loops: Maximum ReAct iterations (DEEP mode, default: 10).
-            max_token_budget: LLM token budget (DEEP mode, default: 64000).
+            max_token_budget: LLM token budget (DEEP mode, default: 128000).
             max_depth: Maximum directory depth for file search (default: 5).
                 Used in both FILENAME_ONLY and DEEP modes.
-            top_k_files: Max files for evidence extraction (default: 3).
+            top_k_files: Max files for evidence extraction (default: 5).
             enable_dir_scan: Enable directory scanning (FAST and DEEP modes).
             include: File glob patterns to include (e.g. ``["*.py", "*.md"]``).
                 Used in both FILENAME_ONLY and DEEP modes.
@@ -1921,14 +1920,14 @@ class AgenticSearch(BaseSearch):
         # Join windows with separator when there are gaps
         return "\n[...]\n".join(parts)
 
-    @staticmethod
+    @classmethod
     async def _fast_read_file_head(
-            file_path: str, max_chars: int = 8_000,
+            cls, file_path: str, max_chars: int = 8_000,
     ) -> str:
         """Read the head of a file as last-resort evidence."""
         try:
             p = Path(file_path)
-            if p.suffix.lower() in AgenticSearch._FAST_TEXT_EXTENSIONS:
+            if p.suffix.lower() in cls._FAST_TEXT_EXTENSIONS:
                 text = p.read_text(encoding="utf-8", errors="replace")
             else:
                 from sirchmunk.utils.file_utils import fast_extract
@@ -2480,7 +2479,7 @@ class AgenticSearch(BaseSearch):
             Merged context string, or empty string if nothing cached.
         """
         parts: List[str] = []
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         stale_seconds = stale_hours * 3600
 
         for sp in paths:
@@ -2491,8 +2490,10 @@ class AgenticSearch(BaseSearch):
                 raw = spec_file.read_text(encoding="utf-8")
                 data = json.loads(raw)
 
-                # Skip if stale
+                # Skip if stale (handle both naive and aware timestamps)
                 cached_at = datetime.fromisoformat(data.get("cached_at", "2000-01-01"))
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
                 if (now - cached_at).total_seconds() > stale_seconds:
                     await self._logger.debug(f"[SpecCache] Stale cache for {sp} (>{stale_hours}h), skipping")
                     continue
@@ -2601,7 +2602,7 @@ class AgenticSearch(BaseSearch):
 
                     data = {
                         "search_path": sp,
-                        "cached_at": datetime.now().isoformat(),
+                        "cached_at": datetime.now(timezone.utc).isoformat(),
                         "total_llm_tokens": context.total_llm_tokens,
                         "loop_count": context.loop_count,
                         "files_read": files_in_path,
