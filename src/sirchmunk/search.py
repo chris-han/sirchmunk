@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import traceback
@@ -15,6 +16,7 @@ from sirchmunk.base import BaseSearch
 from sirchmunk.learnings.knowledge_base import KnowledgeBase
 from sirchmunk.llm.openai_chat import OpenAIChat
 from sirchmunk.llm.prompts import (
+    KEYWORD_QUERY_PLACEHOLDER,
     generate_keyword_extraction_prompt,
     FAST_QUERY_ANALYSIS,
     ROI_RESULT_SUMMARY,
@@ -76,6 +78,8 @@ _CHAT_RESPONSE_SYSTEM = (
     "rather than a search query. Respond naturally and helpfully in 1-3 sentences. "
     "Reply in the same language as the user's message."
 )
+
+_NO_RESULTS_MESSAGE = "No results found."
 
 
 class AgenticSearch(BaseSearch):
@@ -160,7 +164,7 @@ class AgenticSearch(BaseSearch):
                 else:
                     embedding_cache = os.getenv("EMBEDDING_CACHE_DIR")
                     cache_dir = (
-                        embedding_cache
+                        os.path.expanduser(embedding_cache)
                         if embedding_cache
                         else str(self.work_path / ".cache" / "models")
                     )
@@ -348,12 +352,16 @@ class AgenticSearch(BaseSearch):
         except Exception as e:
             _loguru_logger.warning(f"Failed to load historical knowledge: {e}")
 
-    async def _try_reuse_cluster(self, query: str) -> Optional[KnowledgeCluster]:
+    async def _try_reuse_cluster(self, query: str, paths: Optional[List[str]] = None) -> Optional[KnowledgeCluster]:
         """Try to reuse existing knowledge cluster based on semantic similarity.
 
         The method waits (non-blocking) for the embedding model to become
         ready so that reuse works reliably even on the first search call
         within a process.
+
+        Args:
+            query: The search query string.
+            paths: Optional list of file paths to filter cluster search scope.
 
         Returns:
             KnowledgeCluster if a suitable cached cluster is found, None otherwise.
@@ -383,6 +391,7 @@ class AgenticSearch(BaseSearch):
                 query_embedding=query_embedding,
                 top_k=self.cluster_sim_top_k,
                 similarity_threshold=self.cluster_sim_threshold,
+                search_paths=paths,
             )
 
             if not similar_clusters:
@@ -726,31 +735,36 @@ class AgenticSearch(BaseSearch):
             return []
 
     @staticmethod
-    def _parse_summary_response(llm_response: str) -> Tuple[str, bool]:
+    def _parse_summary_response(llm_response: str) -> Tuple[str, bool, bool]:
         """
-        Parse LLM response to extract summary and save decision.
+        Parse LLM response to extract summary and quality decisions.
 
         Args:
-            llm_response: Raw LLM response containing SUMMARY and SHOULD_SAVE tags
+            llm_response: Raw LLM response containing SUMMARY, SHOULD_ANSWER and SHOULD_SAVE tags
 
         Returns:
-            Tuple of (summary_text, should_save_flag)
+            Tuple of (summary_text, should_save_flag, should_answer_flag)
         """
-        # Extract SUMMARY content
-        summary_fields = extract_fields(content=llm_response, tags=["SUMMARY", "SHOULD_SAVE"])
+        summary_fields = extract_fields(
+            content=llm_response,
+            tags=["SUMMARY", "SHOULD_ANSWER", "SHOULD_SAVE"],
+        )
 
-        summary = summary_fields.get("summary", "").strip()
-        should_save_str = summary_fields.get("should_save", "true").strip().lower()
+        summary = str(summary_fields.get("summary") or "").strip()
+        should_answer_str = str(summary_fields.get("should_answer") or "false").strip().lower()
+        should_save_str = str(summary_fields.get("should_save") or "false").strip().lower()
 
-        # Parse should_save flag
+        should_answer = should_answer_str in ["true", "yes", "1"]
         should_save = should_save_str in ["true", "yes", "1"]
 
-        # If extraction failed, use entire response as summary and assume should save
+        # If extraction failed, use entire response as summary and default to conservative:
+        # not answerable and not saveable.
         if not summary:
             summary = llm_response.strip()
-            should_save = True
+            should_answer = False
+            should_save = False
 
-        return summary, should_save
+        return summary, should_save, should_answer
 
     @staticmethod
     def _extract_and_validate_multi_level_keywords(
@@ -925,6 +939,7 @@ class AgenticSearch(BaseSearch):
         return_context: bool = False,
         spec_stale_hours: float = 72.0,
         chat_history: Optional[List[Dict[str, str]]] = None,
+        llm_fallback: bool = False,
     ) -> Union[str, SearchContext, List[Dict[str, Any]]]:
         """Perform intelligent search with multi-mode support.
 
@@ -1006,6 +1021,10 @@ class AgenticSearch(BaseSearch):
                 that carries ``answer``, ``cluster`` (KnowledgeCluster),
                 and full pipeline telemetry (LLM usage, files read, etc.).
             spec_stale_hours: Hours before spec cache is stale (default: 72).
+            chat_history: Optional list of chat messages for context (DEEP mode).
+            llm_fallback: When True, if no relevant documents are found,
+                the LLM will attempt to answer the query from its own
+                knowledge. Default False.
 
         Returns:
             - ``str``: Answer summary (default).
@@ -1052,6 +1071,7 @@ class AgenticSearch(BaseSearch):
                 query=query, paths=paths, max_depth=max_depth,
                 top_k_files=top_k_files, enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
+                llm_fallback=llm_fallback,
             )
         else:
             answer, cluster, context = await self._search_deep(
@@ -1061,12 +1081,16 @@ class AgenticSearch(BaseSearch):
                 enable_dir_scan=enable_dir_scan,
                 include=include, exclude=exclude,
                 spec_stale_hours=spec_stale_hours,
+                llm_fallback=llm_fallback,
             )
 
         # ---- Unified return wrapping ----
         if return_context:
             prefix = "FS" if mode == "FAST" else "DS"
             context.answer = answer
+            if (answer or "").strip().lower() == _NO_RESULTS_MESSAGE.lower():
+                context.cluster = cluster
+                return context
             # Use read_file_ids from context if available, otherwise empty
             fallback_files = list(context.read_file_ids) if context.read_file_ids else None
             context.cluster = cluster or self._make_answer_cluster(
@@ -1092,6 +1116,7 @@ class AgenticSearch(BaseSearch):
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
         spec_stale_hours: float = 72.0,
+        llm_fallback: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Parallel multi-path retrieval pipeline (Phases 0a–5).
 
@@ -1116,7 +1141,7 @@ class AgenticSearch(BaseSearch):
         # When reuse_knowledge=True and a similar cluster is found, we
         # return here — Phase 5 (Persistence) is not executed for that path.
         # ==============================================================
-        reused = await self._try_reuse_cluster(query)
+        reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
             content = reused.content
             if isinstance(content, list):
@@ -1223,12 +1248,29 @@ class AgenticSearch(BaseSearch):
 
         if cluster and cluster.content:
             await self._logger.info("[Phase 4] Evidence sufficient, generating summary")
-            answer, should_save = await self._summarise_cluster(query, cluster)
+            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
+            if not should_answer:
+                if llm_fallback:
+                    await self._logger.info(
+                        "[Phase 4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                    )
+                    answer, should_save = await self._summarise_cluster_fallback(query)
+                else:
+                    await self._logger.warning(
+                        "[Phase 4] Summary gate rejected evidence and llm_fallback=False "
+                        "→ returning no results"
+                    )
+                    return _NO_RESULTS_MESSAGE, None, context
             if not cluster.search_results:
                 cluster.search_results = list(merged_files)
+        elif llm_fallback:
+            await self._logger.info(
+                "[Phase 4] Evidence insufficient, llm_fallback=True \u2192 LLM summary"
+            )
+            answer, should_save = await self._summarise_cluster_fallback(query)
         else:
             await self._logger.info("[Phase 4] Evidence insufficient, launching ReAct refinement")
-            answer, context = await self._react_refinement(
+            react_answer, context = await self._react_refinement(
                 query=query, paths=paths,
                 initial_keywords=initial_keywords, spec_context=spec_context,
                 enable_dir_scan=enable_dir_scan,
@@ -1238,11 +1280,33 @@ class AgenticSearch(BaseSearch):
 
             if not cluster:
                 cluster = await self._build_cluster_from_context(
-                    query=query, answer=answer, context=context,
+                    query=query, answer=react_answer, context=context,
                     query_keywords=query_keywords, top_k_files=top_k_files,
                 )
-            elif answer and not cluster.content:
-                cluster.content = answer
+            elif react_answer and not cluster.content:
+                cluster.content = react_answer
+
+            if not cluster:
+                await self._logger.warning(
+                    "[Phase 4] ReAct found no buildable evidence and llm_fallback=False "
+                    "→ returning no results"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
+
+            # Final DEEP decision is always made in the summary call.
+            answer, should_save, should_answer = await self._summarise_cluster(query, cluster)
+            if not should_answer:
+                if llm_fallback:
+                    await self._logger.info(
+                        "[Phase 4] Final summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                    )
+                    answer, should_save = await self._summarise_cluster_fallback(query)
+                else:
+                    await self._logger.warning(
+                        "[Phase 4] Final summary gate rejected evidence and llm_fallback=False "
+                        "→ returning no results"
+                    )
+                    return _NO_RESULTS_MESSAGE, None, context
 
         # Sync LLM token accounting into context
         new_usages = self.llm_usages[_llm_usage_start:]
@@ -1531,6 +1595,15 @@ class AgenticSearch(BaseSearch):
     }
     _FAST_CONTEXT_WINDOW = 30  # ± lines around each grep hit
     _FAST_MAX_EVIDENCE_CHARS = 15_000
+    _FAST_SMALL_FILE_THRESHOLD = 100_000  # 100K chars - read full file instead of grep sampling
+
+    _LLM_FALLBACK_EVIDENCE = (
+        "[No relevant documents found]\n\n"
+        "The search did not find relevant content in the available documents. "
+        "Please answer the user's question based on your own knowledge. "
+        "Clearly indicate that this answer is from LLM knowledge, "
+        "not from retrieved documents."
+    )
 
     async def _search_fast(
         self,
@@ -1542,6 +1615,7 @@ class AgenticSearch(BaseSearch):
         enable_dir_scan: bool = False,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
+        llm_fallback: bool = False,
     ) -> Tuple[str, Optional[KnowledgeCluster], SearchContext]:
         """Greedy search: 2-3 LLM calls, single best file, focused evidence.
 
@@ -1562,7 +1636,7 @@ class AgenticSearch(BaseSearch):
         # Step 0: Cluster reuse — instant short-circuit (no LLM cost)
         # When reuse succeeds we return here; no persistence step runs.
         # ==============================================================
-        reused = await self._try_reuse_cluster(query)
+        reused = await self._try_reuse_cluster(query, paths)
         if reused is not None:
             content = reused.content
             if isinstance(content, list):
@@ -1635,6 +1709,12 @@ class AgenticSearch(BaseSearch):
         if fallback_alt:
             fallback = fallback + fallback_alt
 
+        # --- IDF weights from LLM ---
+        keyword_idfs: Dict[str, float] = analysis.get("idf", {})
+        if not keyword_idfs:
+            all_kws = (primary or []) + (fallback or [])
+            keyword_idfs = {kw: max(0.5, min(1.0, len(kw) / 5.0)) for kw in all_kws}
+
         if not primary and not fallback:
             await self._logger.warning("[FAST] No keywords extracted")
             msg = f"Could not extract search terms from query: '{query}'"
@@ -1659,21 +1739,26 @@ class AgenticSearch(BaseSearch):
             include=include_patterns or None, exclude=exclude,
         )
 
-        best_file: Optional[Dict[str, Any]] = None
+        best_files: Optional[List[Dict[str, Any]]] = None
         used_level = "primary"
+        evidence = ""
 
         if primary:
-            best_file = await self._fast_find_best_file(primary, **rga_kwargs)
+            best_files = await self._fast_find_best_file(
+                primary, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
+            )
 
-        if not best_file and fallback:
+        if not best_files and fallback:
             used_level = "fallback"
             await self._logger.info(
                 "[FAST:Step2] Primary miss, trying fine-grained fallback"
             )
-            best_file = await self._fast_find_best_file(fallback, **rga_kwargs)
+            best_files = await self._fast_find_best_file(
+                fallback, top_k=top_k_files, keyword_idfs=keyword_idfs, **rga_kwargs
+            )
 
         # --- Fallback: use dir_scan only when rga misses and dir scan is enabled ---
-        if not best_file and enable_dir_scan:
+        if not best_files and enable_dir_scan:
             scan_result = await self._probe_dir_scan(paths, enable=True, max_files=300)
             if scan_result is not None:
                 await self._logger.info("[FAST:Step2] rga miss — falling back to dir_scan ranking")
@@ -1682,37 +1767,87 @@ class AgenticSearch(BaseSearch):
                 )
                 if ranked_paths:
                     used_level = "dir_scan"
-                    best_file = {"path": ranked_paths[0], "matches": [], "total_matches": 0}
+                    best_files = [{"path": p, "matches": [], "total_matches": 0, "weighted_score": 0.0} for p in ranked_paths[:top_k_files]]
 
-        if not best_file:
-            await self._logger.warning(
-                f"[FAST:Step2] No matching files found in paths: {paths}. "
-                "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
+        if not best_files:
+            if llm_fallback:
+                await self._logger.info(
+                    "[FAST:Step2] No files found, llm_fallback=True \u2192 skip to LLM summary"
+                )
+                evidence = self._LLM_FALLBACK_EVIDENCE
+            else:
+                await self._logger.warning(
+                    f"[FAST:Step2] No matching files found in paths: {paths}. "
+                    "If files are PDFs/DOCX, ensure poppler-utils and pandoc are installed."
+                )
+                return _NO_RESULTS_MESSAGE, None, context
+
+        if best_files:
+            file_path = best_files[0]["path"]
+            match_objects = best_files[0].get("matches", [])
+            await self._logger.info(
+                f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
+                f"({best_files[0].get('total_matches', 0)} hits, score={best_files[0].get('weighted_score', 0):.2f})"
             )
-            msg = f"No relevant content found for query: '{query}'"
-            return msg, None, context
 
-        file_path = best_file["path"]
-        match_objects = best_file["matches"]
-        await self._logger.info(
-            f"[FAST:Step2] Best file ({used_level}): {Path(file_path).name} "
-            f"({best_file['total_matches']} hits)"
-        )
+            # ==============================================================
+            # Step 3: Context sampling around grep hits (no LLM)
+            # Multi-file evidence aggregation
+            # ==============================================================
+            evidence_parts = []
+            total_evidence_chars = 0
+            for bf in best_files:
+                if total_evidence_chars >= self._FAST_MAX_EVIDENCE_CHARS:
+                    break
 
-        # ==============================================================
-        # Step 3: Context sampling around grep hits (no LLM)
-        # ==============================================================
-        evidence = await self._fast_sample_evidence(file_path, match_objects)
-        context.mark_file_read(file_path)
+                file_path = bf["path"]
+                fname = Path(file_path).name
+                ext = Path(file_path).suffix.lower()
 
-        if not evidence or len(evidence.strip()) < 20:
-            await self._logger.warning("[FAST:Step3] No usable evidence extracted")
-            msg = f"Found file but could not extract content for query: '{query}'"
-            return msg, None, context
+                # Small file short-circuit: read full content instead of grep sampling
+                ev = None
+                if ext in self._FAST_TEXT_EXTENSIONS:
+                    try:
+                        file_size = Path(file_path).stat().st_size
+                        if file_size < self._FAST_SMALL_FILE_THRESHOLD:
+                            full_text = Path(file_path).read_text(errors="replace")
+                            if len(full_text) < self._FAST_SMALL_FILE_THRESHOLD:
+                                ev = f"[{fname}]\n{full_text}"
+                                await self._logger.info(
+                                    f"[FAST] Small file short-circuit: reading full content of {fname} "
+                                    f"({len(full_text)} chars)"
+                                )
+                    except Exception:
+                        pass  # Fall through to normal evidence extraction
 
-        await self._logger.info(
-            f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
-        )
+                # Normal path: grep-based evidence sampling
+                if ev is None:
+                    ev = await self._fast_sample_evidence(file_path, bf.get("matches", []))
+
+                if ev:
+                    remaining = self._FAST_MAX_EVIDENCE_CHARS - total_evidence_chars
+                    chunk = ev[:remaining]
+                    evidence_parts.append(chunk)
+                    total_evidence_chars += len(chunk)
+                    context.mark_file_read(file_path)
+
+            evidence = "\n\n---\n\n".join(evidence_parts)
+
+            if not evidence or len(evidence.strip()) < 20:
+                if llm_fallback:
+                    await self._logger.info(
+                        "[FAST:Step3] No usable evidence, llm_fallback=True \u2192 LLM summary"
+                    )
+                    evidence = self._LLM_FALLBACK_EVIDENCE
+                else:
+                    await self._logger.warning("[FAST:Step3] No usable evidence extracted")
+                    return _NO_RESULTS_MESSAGE, None, context
+
+            await self._logger.info(
+                f"[FAST:Step3] Evidence: {len(evidence)} chars from {Path(file_path).name}"
+            )
+
+        keywords_used = primary if used_level == "primary" else fallback
 
         # ==============================================================
         # Step 4: LLM answer from focused evidence (single call)
@@ -1731,9 +1866,21 @@ class AgenticSearch(BaseSearch):
                 answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
             )
 
-        answer, should_save = self._parse_summary_response(answer_resp.content or "")
-        keywords_used = primary if used_level == "primary" else fallback
-
+        answer, should_save, should_answer = self._parse_summary_response(
+            answer_resp.content or ""
+        )
+        if not should_answer:
+            if llm_fallback:
+                await self._logger.info(
+                    "[FAST:Step4] Summary gate rejected evidence, llm_fallback=True → LLM fallback"
+                )
+                answer, should_save = await self._summarise_fast_fallback(query, context)
+            else:
+                await self._logger.warning(
+                    "[FAST:Step4] Summary gate rejected evidence and llm_fallback=False "
+                    "→ returning no results"
+                )
+                return _NO_RESULTS_MESSAGE, None, context
         if not should_save:
             await self._logger.info("[FAST] Quality gate: low-quality answer, skipping cluster save")
             await self._logger.success("[FAST] Search complete (2 LLM calls, no persist)")
@@ -1755,6 +1902,142 @@ class AgenticSearch(BaseSearch):
 
     # ---- FAST helpers ----
 
+    @staticmethod
+    def _count_keyword_tf_per_file(raw_results: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Count matches per file from rga JSON output."""
+        counts: Dict[str, int] = {}
+        current_path: Optional[str] = None
+        for item in raw_results:
+            item_type = item.get("type")
+            if item_type == "begin":
+                current_path = item.get("data", {}).get("path", {}).get("text")
+            elif item_type == "match" and current_path is not None:
+                counts[current_path] = counts.get(current_path, 0) + 1
+            elif item_type == "end":
+                current_path = None
+        return counts
+
+    @staticmethod
+    def _dedup_merged_files(
+        merged: List[Dict[str, Any]],
+        per_file_kw_tf: Dict[str, Dict[str, int]],
+        match_limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Deduplicate merged file entries by path, combining matches from
+        multiple keyword searches into a single entry per file.
+
+        When the same file appears in multiple rga begin/end groups (one per
+        keyword search), this merges them so downstream scoring and evidence
+        extraction operate on a single, complete representation.
+
+        Args:
+            merged: File entries from GrepRetriever.merge_results(), may
+                contain duplicates.
+            per_file_kw_tf: Pre-computed per-file keyword TF counts (not
+                modified, used only for reference).
+            match_limit: Maximum matches to keep per file after merging.
+
+        Returns:
+            Deduplicated list with one entry per unique file path.
+        """
+        if not merged:
+            return merged
+
+        seen: Dict[str, int] = {}  # path -> index in deduped
+        deduped: List[Dict[str, Any]] = []
+
+        for entry in merged:
+            fpath = entry["path"]
+            if fpath in seen:
+                # Merge into existing entry
+                idx = seen[fpath]
+                existing = deduped[idx]
+                existing["matches"].extend(entry.get("matches", []))
+                existing["lines"].extend(entry.get("lines", []))
+                existing["total_matches"] += entry.get("total_matches", 0)
+            else:
+                # New file — clone to avoid mutating original
+                seen[fpath] = len(deduped)
+                deduped.append({
+                    "path": fpath,
+                    "matches": list(entry.get("matches", [])),
+                    "lines": list(entry.get("lines", [])),
+                    "total_matches": entry.get("total_matches", 0),
+                    "total_score": entry.get("total_score", 0.0),
+                })
+
+        # Trim matches to limit per file
+        for entry in deduped:
+            if len(entry["matches"]) > match_limit:
+                # Sort by score descending, keep top
+                entry["matches"].sort(
+                    key=lambda x: x.get("score", 0.0), reverse=True
+                )
+                entry["matches"] = entry["matches"][:match_limit]
+
+        return deduped
+
+    @staticmethod
+    def _prune_by_score(
+        candidates: List[Dict[str, Any]],
+        top_k: int = 3,
+        relative_ratio: float = 0.30,
+        gap_ratio: float = 0.50,
+        min_count: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Dynamically prune ranked file candidates by score distribution.
+
+        Applies a three-stage filter to remove clearly irrelevant files:
+
+        1. **Relative threshold**: Discard files scoring below
+           ``max_score * relative_ratio`` (default 30%).
+        2. **Gap detection**: Scan adjacently ranked files; when the score
+           drop from one to the next exceeds ``prev_score * gap_ratio``
+           (default 50%), truncate the list at that point.
+        3. **Minimum guarantee**: Ensure at least ``min_count`` files
+           survive (default 1).
+
+        Finally the result is capped at ``top_k``.
+
+        Args:
+            candidates: File dicts sorted by ``weighted_score`` descending.
+            top_k: Maximum number of files to return.
+            relative_ratio: Fraction of the top score used as a floor.
+            gap_ratio: Maximum tolerated relative drop between adjacent
+                candidates.
+            min_count: Minimum number of candidates to keep regardless of
+                score.
+
+        Returns:
+            Pruned list of candidates (length in [min_count, top_k]).
+        """
+        if not candidates:
+            return []
+
+        max_score = candidates[0].get("weighted_score", 0.0)
+
+        # Step 1: Relative threshold filter
+        threshold = max_score * relative_ratio
+        filtered = [f for f in candidates if f.get("weighted_score", 0.0) >= threshold]
+        if not filtered:
+            filtered = candidates[:min_count]
+
+        # Step 2: Gap detection truncation
+        result = [filtered[0]]
+        for i in range(1, len(filtered)):
+            prev_score = filtered[i - 1].get("weighted_score", 0.0)
+            curr_score = filtered[i].get("weighted_score", 0.0)
+            if prev_score > 0 and (prev_score - curr_score) > prev_score * gap_ratio:
+                break
+            result.append(filtered[i])
+
+        # Step 3: Minimum guarantee
+        if len(result) < min_count and len(filtered) >= min_count:
+            result = filtered[:min_count]
+
+        # Cap at top_k
+        return result[:top_k]
+
     async def _fast_find_best_file(
         self,
         keywords: List[str],
@@ -1762,13 +2045,17 @@ class AgenticSearch(BaseSearch):
         max_depth: Optional[int] = 5,
         include: Optional[List[str]] = None,
         exclude: Optional[List[str]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Search per keyword via rga and return the single best-matching file.
+        top_k: int = 1,
+        keyword_idfs: Optional[Dict[str, float]] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Search per keyword via rga and return the top-k best-matching files
+        ranked by IDF-weighted log-TF scoring.
 
         Returns:
-            Merged file dict (path, matches, lines, total_matches) or None.
+            List of merged file dicts (path, matches, lines, total_matches, weighted_score) or None.
         """
         all_raw: List[Dict[str, Any]] = []
+        per_file_kw_tf: Dict[str, Dict[str, int]] = {}  # {file_path: {keyword: count}}
 
         for kw in keywords:
             try:
@@ -1779,6 +2066,10 @@ class AgenticSearch(BaseSearch):
                 )
                 if results:
                     all_raw.extend(results)
+                    # Track per-file TF for this keyword
+                    kw_counts = self._count_keyword_tf_per_file(results)
+                    for fpath, count in kw_counts.items():
+                        per_file_kw_tf.setdefault(fpath, {})[kw] = count
             except Exception as exc:
                 await self._logger.warning(
                     f"[FAST] rga literal search failed for '{kw}': {exc}"
@@ -1796,6 +2087,17 @@ class AgenticSearch(BaseSearch):
                 )
                 if results:
                     all_raw.extend(results)
+                    # For regex OR fallback, attribute matches to individual keywords
+                    # by checking which keywords appear in each match line
+                    # (simplified: count total matches per file, distribute proportionally)
+                    regex_counts = self._count_keyword_tf_per_file(results)
+                    for fpath, count in regex_counts.items():
+                        # Attribute to all keywords equally (approximation for OR regex)
+                        per_kw_share = max(1, count // len(keywords)) if keywords else count
+                        for kw in keywords:
+                            existing = per_file_kw_tf.get(fpath, {}).get(kw, 0)
+                            if existing == 0:  # Only fill if not already set by literal search
+                                per_file_kw_tf.setdefault(fpath, {})[kw] = per_kw_share
             except Exception as exc:
                 await self._logger.warning(
                     f"[FAST] rga regex search failed: {exc}"
@@ -1810,10 +2112,7 @@ class AgenticSearch(BaseSearch):
                     timeout=30.0,
                 )
                 if fn_results:
-                    return {
-                        "path": fn_results[0]["path"],
-                        "matches": [], "lines": [], "total_matches": 0,
-                    }
+                    return [{"path": fn_results[0]["path"], "matches": [], "lines": [], "total_matches": 0, "weighted_score": 0.0}]
             except Exception as exc:
                 await self._logger.warning(
                     f"[FAST] filename search failed: {exc}"
@@ -1824,9 +2123,26 @@ class AgenticSearch(BaseSearch):
         if not merged:
             return None
 
-        # Greedy: pick the file with the most matches
-        merged.sort(key=lambda f: f["total_matches"], reverse=True)
-        return merged[0]
+        # Deduplicate file entries from multi-keyword searches
+        merged = self._dedup_merged_files(merged, per_file_kw_tf)
+
+        # --- IDF × (1 + log TF) weighted scoring ---
+        _idfs = keyword_idfs or {}
+        for f in merged:
+            fpath = f["path"]
+            kw_tf = per_file_kw_tf.get(fpath, {})
+            score = 0.0
+            for kw in keywords:
+                tf = kw_tf.get(kw, 0)
+                if tf > 0:
+                    idf = _idfs.get(kw, max(0.5, min(1.0, len(kw) / 5.0)))
+                    score += idf * (1.0 + math.log(tf))
+            f["weighted_score"] = score
+
+        merged.sort(key=lambda f: f["weighted_score"], reverse=True)
+        pruned = self._prune_by_score(merged, top_k=top_k)
+
+        return pruned if pruned else None
 
     async def _fast_sample_evidence(
         self,
@@ -1853,15 +2169,35 @@ class AgenticSearch(BaseSearch):
             if isinstance(ln, int):
                 hit_lines.append(ln)
 
+        # Diagnostic logging when falling back to snippet mode
+        if not hit_lines and match_objects:
+            await self._logger.warning(
+                f"[FAST] No line_number in {len(match_objects)} match(es) for {fname}, "
+                f"falling back to snippet mode"
+            )
+
         # --- Text files: read context windows around hits ---
         if ext in self._FAST_TEXT_EXTENSIONS and hit_lines:
+            # Expand context window for sparse hits
+            window = self._FAST_CONTEXT_WINDOW
+            if len(hit_lines) <= 2:
+                window = max(window, 100)  # ±100 lines for 1-2 hits
             evidence = self._read_context_windows(
                 file_path, hit_lines,
-                window=self._FAST_CONTEXT_WINDOW,
+                window=window,
                 max_chars=self._FAST_MAX_EVIDENCE_CHARS,
             )
             if evidence:
-                return f"[{fname}]\n{evidence}"
+                full_evidence = f"[{fname}]\n{evidence}"
+                if len(full_evidence) < 100:
+                    await self._logger.info(
+                        f"[FAST] Context window evidence too thin ({len(full_evidence)} chars) for {fname}, "
+                        f"attempting file head extraction"
+                    )
+                    head_evidence = await self._fast_read_file_head(file_path)
+                    if head_evidence and len(head_evidence) > len(full_evidence):
+                        return head_evidence
+                return full_evidence
 
         # --- Non-text files or no line numbers: use grep snippets ---
         snippets: List[str] = []
@@ -1876,7 +2212,17 @@ class AgenticSearch(BaseSearch):
                 break
 
         if snippets:
-            return f"[{fname}]\n" + "\n".join(snippets)
+            snippet_evidence = f"[{fname}]\n" + "\n".join(snippets)
+            # If snippet evidence is too thin, try file head for richer context
+            if len(snippet_evidence) < 100:
+                await self._logger.info(
+                    f"[FAST] Evidence too thin ({len(snippet_evidence)} chars) for {fname}, "
+                    f"attempting file head extraction"
+                )
+                head_evidence = await self._fast_read_file_head(file_path)
+                if head_evidence and len(head_evidence) > len(snippet_evidence):
+                    return head_evidence
+            return snippet_evidence
 
         # Last resort: try reading file head
         return await self._fast_read_file_head(file_path)
@@ -1990,7 +2336,7 @@ class AgenticSearch(BaseSearch):
         """
         await self._logger.info("[Probe:Keywords] Extracting keywords...")
         dynamic_prompt = generate_keyword_extraction_prompt(num_levels=2)
-        keyword_prompt = dynamic_prompt.format(user_input=query)
+        keyword_prompt = dynamic_prompt.replace(KEYWORD_QUERY_PLACEHOLDER, query)
         kw_response = await self.llm.achat(
             messages=[{"role": "user", "content": keyword_prompt}],
             stream=False,
@@ -2337,12 +2683,13 @@ class AgenticSearch(BaseSearch):
 
     async def _summarise_cluster(
         self, query: str, cluster: KnowledgeCluster,
-    ) -> Tuple[str, bool]:
+    ) -> Tuple[str, bool, bool]:
         """Generate a final answer summary from a KnowledgeCluster.
 
         Returns:
-            ``(summary_text, should_save)`` — *should_save* is the LLM's
-            quality verdict on whether the result is worth persisting.
+            ``(summary_text, should_save, should_answer)`` where:
+            - should_save: quality verdict for persistence
+            - should_answer: evidence sufficiency verdict for answering
         """
         sep = "\n"
         cluster_text_content = (
@@ -2363,8 +2710,52 @@ class AgenticSearch(BaseSearch):
         )
         self.llm_usages.append(response.usage)
 
-        summary, should_save = self._parse_summary_response(response.content)
-        return summary, should_save
+        summary, should_save, should_answer = self._parse_summary_response(response.content)
+        return summary, should_save, should_answer
+
+    async def _summarise_cluster_fallback(self, query: str) -> Tuple[str, bool]:
+        """Generate an answer using the DEEP summary prompt with fallback evidence.
+
+        Reuses the existing ``SEARCH_RESULT_SUMMARY`` prompt, feeding it the
+        standard fallback text so that the LLM answers from its own knowledge
+        without adding an extra LLM call to the pipeline.
+        """
+        result_sum_prompt = SEARCH_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=self._LLM_FALLBACK_EVIDENCE,
+        )
+        await self._logger.info("[Phase 4] Generating fallback summary from LLM knowledge...")
+        response = await self.llm.achat(
+            messages=[{"role": "user", "content": result_sum_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(response.usage)
+        summary, _, _ = self._parse_summary_response(response.content)
+        return summary, False  # Never save fallback answers
+
+    async def _summarise_fast_fallback(
+        self, query: str, context: "SearchContext",
+    ) -> Tuple[str, bool]:
+        """Generate an answer using the FAST summary prompt with fallback evidence.
+
+        Reuses the existing ``ROI_RESULT_SUMMARY`` prompt, feeding it the
+        standard fallback text so that the LLM answers from its own knowledge.
+        """
+        answer_prompt = ROI_RESULT_SUMMARY.format(
+            user_input=query,
+            text_content=self._LLM_FALLBACK_EVIDENCE,
+        )
+        answer_resp = await self.llm.achat(
+            messages=[{"role": "user", "content": answer_prompt}],
+            stream=True,
+        )
+        self.llm_usages.append(answer_resp.usage)
+        if answer_resp.usage and isinstance(answer_resp.usage, dict):
+            context.add_llm_tokens(
+                answer_resp.usage.get("total_tokens", 0), usage=answer_resp.usage,
+            )
+        answer, _, _ = self._parse_summary_response(answer_resp.content or "")
+        return answer, False  # Never save fallback answers
 
     async def _react_refinement(
         self,

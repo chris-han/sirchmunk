@@ -31,6 +31,9 @@ Requirements:
 """
 
 
+KEYWORD_QUERY_PLACEHOLDER = "__SIRCHMUNK_USER_QUERY__"
+
+
 QUERY_KEYWORDS_EXTRACTION = """
 ### Role: Search Optimization Expert & Information Retrieval Specialist
 
@@ -67,11 +70,11 @@ Output {num_levels} separate JSON-like dicts within their respective tags, follo
 {output_format_example}
 
 <KEYWORDS_ALT>
-{{{{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}}}
+{{"translated_keyword1": idf_value, "translated_keyword2": idf_value}}
 </KEYWORDS_ALT>
 
 ### User Query:
-{{user_input}}
+{query_placeholder}
 
 ### {num_levels}-Level Keywords (Coarse to Fine):
 """
@@ -81,14 +84,14 @@ def generate_keyword_extraction_prompt(num_levels: int = 3) -> str:
     """
     Generate a dynamic keyword extraction prompt template based on the number of levels.
     
-    The returned template still contains {{user_input}} placeholder that needs to be
-    filled in by the caller.
+    The returned template still contains a stable placeholder token that
+    needs to be replaced by the caller.
     
     Args:
         num_levels: Number of granularity levels (default: 3)
     
     Returns:
-        Prompt template string with {{user_input}} placeholder
+        Prompt template string with a query placeholder token
     """
     # Generate level descriptions with granularity focus
     level_descriptions = []
@@ -123,12 +126,14 @@ def generate_keyword_extraction_prompt(num_levels: int = 3) -> str:
             f"<KEYWORDS_LEVEL_{i}>\n{example_dict}\n</KEYWORDS_LEVEL_{i}>"
         )
     
-    # Format the template with num_levels, descriptions, and examples
-    # Note: {{user_input}} becomes {user_input} after this format call
+    # Format the template with num_levels, descriptions, and examples.
+    # The user query placeholder remains untouched and is replaced later
+    # with a simple string replace to avoid a fragile second `.format()`.
     return QUERY_KEYWORDS_EXTRACTION.format(
         num_levels=num_levels,
         level_descriptions="\n\n".join(level_descriptions),
-        output_format_example="\n\n".join(output_examples)
+        output_format_example="\n\n".join(output_examples),
+        query_placeholder=KEYWORD_QUERY_PLACEHOLDER,
     )
 
 
@@ -175,17 +180,24 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 - **Search Result Text**: {text_content}
 
 ### Quality Evaluation
-After generating the summary, evaluate whether this knowledge cluster is worth saving to the persistent cache based on:
+After generating the summary, make TWO decisions:
+1) whether the query can be answered from the provided evidence;
+2) whether this knowledge cluster is worth saving to persistent cache.
+
+Evaluate based on:
 1. Does the search result contain substantial, relevant information for the user input?
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-If YES to all above, output "true"; otherwise output "false".
+- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
+- If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
 <SUMMARY>
 [Generate the Markdown Briefing here]
 </SUMMARY>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
 
@@ -352,7 +364,7 @@ FAST_QUERY_ANALYSIS = """Classify the user query and, if it is a document/file s
 
 ### Output
 Return JSON only, no extra text:
-{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "..."}}
+{{"type": "search", "primary": ["compound phrase"], "fallback": ["term1", "term2"], "idf": {{"compound phrase": 8.0, "term1": 2.5, "term2": 6.0}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "..."}}
 
 Rules:
 - **type**: "search" if the query requires retrieving information from files or documents; "chat" if it is a greeting, small talk, identity question, or any other conversational message that does NOT need file retrieval. When type is "chat", set primary and fallback to empty arrays and put a brief natural reply (same language as the query) in "response". "summary" if the user wants to summarize, review, or analyze entire documents without searching for specific information — set primary/fallback to empty arrays.
@@ -361,18 +373,19 @@ Rules:
 - **primary_alt / fallback_alt**: Cross-lingual equivalents of primary/fallback. If the query is in Chinese, provide English translations; if in English, provide Chinese translations. Only translate the most critical 1-2 terms. Empty arrays if no meaningful translation exists.
 - **file_hints**: filename fragments or glob patterns ONLY if clearly implied; empty array otherwise.
 - **intent**: one sentence describing the query intent.
+- **idf**: Estimated Inverse Document Frequency weight (1.0-10.0 scale) for EVERY keyword in primary, fallback, primary_alt, and fallback_alt. Higher values (7-10) for rare/specific/domain terms; lower values (1-3) for common/generic words. Estimate based on general corpus frequency.
 
 Example: query "How does transformer attention work?"
-→ {{"type": "search", "primary": ["transformer attention"], "fallback": ["attention", "transformer"], "primary_alt": ["注意力机制"], "fallback_alt": ["注意力", "变换器"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
+→ {{"type": "search", "primary": ["transformer attention"], "fallback": ["attention", "transformer"], "idf": {{"transformer attention": 8.5, "attention": 3.0, "transformer": 5.0, "注意力机制": 8.0, "注意力": 3.5, "变换器": 6.0}}, "primary_alt": ["注意力机制"], "fallback_alt": ["注意力", "变换器"], "file_hints": [], "intent": "understand transformer attention mechanism"}}
 
 Example: query "认证机制怎么实现"
-→ {{"type": "search", "primary": ["认证机制"], "fallback": ["认证", "鉴权"], "primary_alt": ["authentication"], "fallback_alt": ["auth"], "file_hints": [], "intent": "了解认证机制的实现方式"}}
+→ {{"type": "search", "primary": ["认证机制"], "fallback": ["认证", "鉴权"], "idf": {{"认证机制": 7.5, "认证": 3.0, "鉴权": 7.0, "authentication": 5.5, "auth": 3.0}}, "primary_alt": ["authentication"], "fallback_alt": ["auth"], "file_hints": [], "intent": "了解认证机制的实现方式"}}
 
 Example: query "你好"
-→ {{"type": "chat", "primary": [], "fallback": [], "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "greeting", "response": "你好！我是 Sirchmunk，一个智能文档搜索助手。有什么可以帮你的？"}}
+→ {{"type": "chat", "primary": [], "fallback": [], "idf": {{}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "greeting", "response": "你好！我是 Sirchmunk，一个智能文档搜索助手。有什么可以帮你的？"}}
 
 Example: query "总结这几篇文档"
-→ {{"type": "summary", "primary": [], "fallback": [], "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "summarize documents"}}
+→ {{"type": "summary", "primary": [], "fallback": [], "idf": {{}}, "primary_alt": [], "fallback_alt": [], "file_hints": [], "intent": "summarize documents"}}
 """
 
 
@@ -390,16 +403,23 @@ Analyze the provided {text_content} and generate a concise summary in the form o
 - **Search Result Text**: {text_content}
 
 ### Quality Evaluation
-After generating the summary, evaluate whether this result is worth caching based on:
+After generating the summary, make TWO decisions:
+1) whether the query can be answered from the provided evidence;
+2) whether this result is worth caching.
+
+Evaluate based on:
 1. Does the search result contain substantial, relevant information for the user input?
 2. Is the content meaningful and not just error messages or "no information found"?
 3. Are there sufficient evidences and context to answer the user's query?
 
-If YES to all above, output "true"; otherwise output "false".
+- <SHOULD_ANSWER>: output "true" only if the evidence is sufficient to answer the query.
+- <SHOULD_SAVE>: output "true" only if the evidence is sufficient AND the result is worth caching.
+- If evidence is insufficient or irrelevant, both SHOULD_ANSWER and SHOULD_SAVE MUST be "false".
 
 ### Output Format
 <SUMMARY>
 [Generate the Markdown Briefing here]
 </SUMMARY>
+<SHOULD_ANSWER>true/false</SHOULD_ANSWER>
 <SHOULD_SAVE>true/false</SHOULD_SAVE>
 """
